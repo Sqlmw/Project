@@ -1,5 +1,7 @@
 """
-第4天：训练随机森林和MLP，在四种划分上评估泛化性能
+第4天：对每种划分分别训练RF和MLP，在各自测试集上评估泛化性能
+
+核心改进：每种划分用自己的训练集（互补集），避免信息泄漏。
 """
 import numpy as np
 import pandas as pd
@@ -7,7 +9,6 @@ import pickle
 import json
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
-from sklearn.model_selection import train_test_split
 from scipy.stats import spearmanr
 
 # 加载数据
@@ -18,55 +19,72 @@ df = pd.read_csv("pdbbind_valid.csv")
 with open('splits.pkl', 'rb') as f:
     splits = pickle.load(f)
 
-# 用随机划分的训练集来训练模型
 indices = np.arange(len(X))
-train_idx, _ = train_test_split(indices, test_size=0.2, random_state=42)
-X_train, y_train = X[train_idx], y[train_idx]
+print(f"总样本: {len(X)}, 特征维度: {X.shape[1]}, pK范围: [{y.min():.2f}, {y.max():.2f}]")
 
-print(f"训练集: {len(X_train)} 个样本")
-print(f"X shape: {X.shape}, y range: [{y.min():.2f}, {y.max():.2f}]")
 
-# ---- 训练随机森林 ----
-print("\n训练 Random Forest...")
-rf = RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=42)
-rf.fit(X_train, y_train)
-print(f"  RF train R^2: {rf.score(X_train, y_train):.3f}")
-
-# ---- 训练 MLP ----
-print("训练 MLP...")
-mlp = MLPRegressor(hidden_layer_sizes=(256, 128, 64), max_iter=300, random_state=42)
-mlp.fit(X_train, y_train)
-print(f"  MLP train R^2: {mlp.score(X_train, y_train):.3f}")
-
-# ---- 评估函数 ----
 def evaluate(model, X_test, y_test):
+    """计算三个评估指标"""
     pred = model.predict(X_test)
-    rho, p = spearmanr(y_test, pred)
+    rho, _ = spearmanr(y_test, pred)
     mae = np.mean(np.abs(pred - y_test))
     rmse = np.sqrt(np.mean((pred - y_test) ** 2))
     return {'Spearman': rho, 'MAE': mae, 'RMSE': rmse}
 
-# ---- 在所有划分上评估 ----
+
+# ---- 对每种划分分别训练+评估 ----
 print("\n========== 评估结果 ==========")
 results = {}
+models = {}
+
 for name, test_idx in splits.items():
     if len(test_idx) == 0:
         continue
-    X_test, y_test = X[test_idx], y[test_idx]
-    rf_res = evaluate(rf, X_test, y_test)
-    mlp_res = evaluate(mlp, X_test, y_test)
-    results[name] = {'RF': rf_res, 'MLP': mlp_res}
-    print(f"\n--- {name} (n={len(test_idx)}) ---")
-    print(f"  RF:  Spearman={rf_res['Spearman']:.3f}, MAE={rf_res['MAE']:.3f}, RMSE={rf_res['RMSE']:.3f}")
-    print(f"  MLP: Spearman={mlp_res['Spearman']:.3f}, MAE={mlp_res['MAE']:.3f}, RMSE={mlp_res['RMSE']:.3f}")
 
-# 保存详细结果
+    # 互补集 = 全部 - 测试集
+    train_idx = np.setdiff1d(indices, test_idx)
+    X_train, y_train = X[train_idx], y[train_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+
+    print(f"\n--- {name} ---")
+    print(f"  训练集: {len(train_idx)}, 测试集: {len(test_idx)}")
+
+    # 训练 RF
+    rf = RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=42)
+    rf.fit(X_train, y_train)
+    rf_train_r2 = rf.score(X_train, y_train)
+    rf_res = evaluate(rf, X_test, y_test)
+    print(f"  RF:  train R2={rf_train_r2:.3f}, test Spearman={rf_res['Spearman']:.3f}, "
+          f"MAE={rf_res['MAE']:.3f}, RMSE={rf_res['RMSE']:.3f}")
+
+    # 训练 MLP
+    mlp = MLPRegressor(hidden_layer_sizes=(256, 128, 64), max_iter=300, random_state=42)
+    mlp.fit(X_train, y_train)
+    mlp_train_r2 = mlp.score(X_train, y_train)
+    mlp_res = evaluate(mlp, X_test, y_test)
+    print(f"  MLP: train R2={mlp_train_r2:.3f}, test Spearman={mlp_res['Spearman']:.3f}, "
+          f"MAE={mlp_res['MAE']:.3f}, RMSE={mlp_res['RMSE']:.3f}")
+
+    results[name] = {'RF': rf_res, 'MLP': mlp_res}
+    models[name] = {'RF': rf, 'MLP': mlp}
+
+# ---- 保存结果 ----
 with open('results.json', 'w') as f:
     json.dump(results, f, indent=2)
 
-# ---- 保存模型 ----
+# 只保存 Random 划分的模型（后续分析用）
 import joblib
-joblib.dump(rf, 'rf_model.pkl')
-joblib.dump(mlp, 'mlp_model.pkl')
+if 'Random' in models:
+    joblib.dump(models['Random']['RF'], 'rf_model.pkl')
+    joblib.dump(models['Random']['MLP'], 'mlp_model.pkl')
 
-print("\n结果已保存: results.json, rf_model.pkl, mlp_model.pkl")
+print("\n========== 汇总 ==========")
+print(f"{'Split':<15} {'RF Spearman':>12} {'RF MAE':>8} {'RF RMSE':>8}  |  {'MLP Spearman':>13} {'MLP MAE':>9} {'MLP RMSE':>9}")
+print("-" * 90)
+for name in results:
+    rf_r = results[name]['RF']
+    mlp_r = results[name]['MLP']
+    print(f"{name:<15} {rf_r['Spearman']:12.3f} {rf_r['MAE']:8.3f} {rf_r['RMSE']:8.3f}  |  "
+          f"{mlp_r['Spearman']:13.3f} {mlp_r['MAE']:9.3f} {mlp_r['RMSE']:9.3f}")
+
+print("\n已保存: results.json")
