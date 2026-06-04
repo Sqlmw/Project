@@ -188,7 +188,9 @@ for seed in range(N_REPEATS):
         X_train, y_train = X[train_idx], y[train_idx]
         X_test, y_test = X[test_idx], y[test_idx]
 
-        rf = RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=seed)
+        rf = RandomForestRegressor(n_estimators=400, max_depth=15,
+                                   min_samples_leaf=3, min_samples_split=6,
+                                   max_features='sqrt', n_jobs=-1, random_state=seed)
         rf.fit(X_train, y_train)
         res = evaluate(rf, X_test, y_test)
         for metric in ['Spearman', 'MAE', 'RMSE']:

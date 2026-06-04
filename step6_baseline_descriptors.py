@@ -183,7 +183,9 @@ for seed in range(N_REPEATS):
 
     for name, test_idx in splits.items():
         train_idx = np.setdiff1d(indices, test_idx)
-        rf = RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=seed)
+        rf = RandomForestRegressor(n_estimators=400, max_depth=15,
+                                   min_samples_leaf=3, min_samples_split=6,
+                                   max_features='sqrt', n_jobs=-1, random_state=seed)
         rf.fit(X_desc[train_idx], y[train_idx])
         rho, mae, rmse = evaluate(rf, X_desc[test_idx], y[test_idx])
         all_results[name]['Spearman'].append(rho)
@@ -262,8 +264,8 @@ ax2.set_ylim(0, 65)
 
 plt.suptitle('PLIF vs Molecular Descriptors', fontsize=14, fontweight='bold')
 plt.tight_layout()
-plt.savefig('baseline_comparison.png', dpi=300)
-print("\n已保存: baseline_comparison.png")
+plt.savefig('baseline_comparison_tuned.png', dpi=300)
+print("\n已保存: baseline_comparison_tuned.png")
 
 # 保存
 desc_results = {}
@@ -277,7 +279,7 @@ for name in ['Random','Scaffold','Seq','Binding Mode']:
         'RMSE_mean': float(np.mean(r['RMSE'])),
         'RMSE_std': float(np.std(r['RMSE'])),
     }
-with open('baseline_descriptors.json', 'w') as f:
+with open('baseline_descriptors_tuned.json', 'w') as f:
     json.dump(desc_results, f, indent=2)
 
 print("\n已保存: baseline_descriptors.json")
