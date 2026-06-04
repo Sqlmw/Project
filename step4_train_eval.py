@@ -1,90 +1,225 @@
 """
-第4天：对每种划分分别训练RF和MLP，在各自测试集上评估泛化性能
-
-核心改进：每种划分用自己的训练集（互补集），避免信息泄漏。
+第4天：对每种划分训练RF，多次重复评估，报告均值±标准差
 """
 import numpy as np
 import pandas as pd
 import pickle
 import json
+import os
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.neural_network import MLPRegressor
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.cluster import KMeans
 from scipy.stats import spearmanr
+from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem
+from rdkit.DataStructs import TanimotoSimilarity
+from Bio.PDB import PDBParser
+from Bio.SeqUtils import seq1
+import warnings
 
-# 加载数据
+RDLogger.logger().setLevel(RDLogger.ERROR)
+warnings.filterwarnings('ignore')
+
+# ============= 加载数据 =============
 X = np.load("X_features.npy")
 y = np.load("y_labels.npy")
 df = pd.read_csv("pdbbind_valid.csv")
-
-with open('splits.pkl', 'rb') as f:
-    splits = pickle.load(f)
-
+refined_dir = "refined-set"
 indices = np.arange(len(X))
-print(f"总样本: {len(X)}, 特征维度: {X.shape[1]}, pK范围: [{y.min():.2f}, {y.max():.2f}]")
+
+N_REPEATS = 5
+print(f"总样本: {len(X)}, 特征: {X.shape[1]}维, pK: [{y.min():.2f}, {y.max():.2f}]")
+print(f"重复次数: {N_REPEATS}")
+
+# ============= 预计算（不随种子变化） =============
+
+# --- 配体 Morgan 指纹 ---
+print("\n预计算配体 Morgan 指纹...")
+def get_morgan_fp(pdb, lig_suffix):
+    lig_path = os.path.join(refined_dir, pdb, f"{pdb}_ligand.{lig_suffix}")
+    try:
+        if lig_suffix == 'mol2':
+            mol = Chem.MolFromMol2File(lig_path, sanitize=True, removeHs=True)
+        else:
+            mol = Chem.MolFromMolFile(lig_path, sanitize=True, removeHs=True)
+        if mol is None:
+            return None
+        return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+    except:
+        return None
+
+fps = {}
+for idx, row in df.iterrows():
+    fp = get_morgan_fp(row['pdb'], row['ligand_suffix'])
+    if fp is not None:
+        fps[idx] = fp
+
+# Tanimoto 贪心聚类
+lig_cluster_of = {}
+lig_clusters = {}
+lig_rep_fps = {}
+cluster_id = 0
+valid_indices_fp = list(fps.keys())
+for idx in valid_indices_fp:
+    fp = fps[idx]
+    assigned = False
+    for cid in list(lig_clusters.keys()):
+        if TanimotoSimilarity(fp, lig_rep_fps[cid]) >= 0.5:
+            lig_clusters[cid].append(idx)
+            lig_cluster_of[idx] = cid
+            assigned = True
+            break
+    if not assigned:
+        cid = f"C{cluster_id}"
+        cluster_id += 1
+        lig_clusters[cid] = [idx]
+        lig_rep_fps[cid] = fp
+        lig_cluster_of[idx] = cid
+
+lig_groups = df.index.map(lambda i: lig_cluster_of.get(i, f"lig_{i}"))
+
+# --- 蛋白序列 + k-mer 聚类 ---
+print("预计算蛋白序列 k-mer 聚类...")
+def extract_seq(pdb):
+    protein_pdb = os.path.join(refined_dir, pdb, f"{pdb}_protein.pdb")
+    parser = PDBParser(QUIET=True)
+    try:
+        structure = parser.get_structure(pdb, protein_pdb)
+    except:
+        return ""
+    seq = ""
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                if residue.get_id()[0] == ' ':
+                    try:
+                        seq += seq1(residue.get_resname())
+                    except:
+                        seq += 'X'
+    return seq
+
+if 'protein_seq' not in df.columns:
+    df['protein_seq'] = df['pdb'].apply(extract_seq)
+
+def kmer_set(seq, k=3):
+    if len(seq) < k:
+        return set()
+    return set(seq[i:i+k] for i in range(len(seq) - k + 1))
+
+def jaccard(set1, set2):
+    if not set1 or not set2:
+        return 0.0
+    inter = len(set1 & set2)
+    union = len(set1 | set2)
+    return inter / union if union > 0 else 0.0
+
+def greedy_kmer_cluster(seqs, k=3, threshold=0.3):
+    sorted_idx = sorted(range(len(seqs)), key=lambda i: len(seqs[i]), reverse=True)
+    kmer_sets = [kmer_set(seqs[i], k) for i in sorted_idx]
+    clusters = {}
+    rep_kmers = {}
+    cluster_of = {}
+    cluster_id_cnt = 0
+    for orig_idx, ks in zip(sorted_idx, kmer_sets):
+        if len(ks) == 0:
+            cluster_of[orig_idx] = f"short_{orig_idx}"
+            continue
+        assigned = False
+        for cid in list(clusters.keys()):
+            if jaccard(ks, rep_kmers[cid]) >= threshold:
+                clusters[cid].append(orig_idx)
+                cluster_of[orig_idx] = cid
+                assigned = True
+                break
+        if not assigned:
+            cid = f"C{cluster_id_cnt}"
+            cluster_id_cnt += 1
+            clusters[cid] = [orig_idx]
+            rep_kmers[cid] = ks
+            cluster_of[orig_idx] = cid
+    return cluster_of
+
+seq_list = df['protein_seq'].tolist()
+seq_cluster_of = greedy_kmer_cluster(seq_list, k=3, threshold=0.3)
+seq_groups = df.index.map(lambda i: seq_cluster_of.get(i, f"uniq_{i}"))
 
 
+# ============= 多次重复评估 =============
 def evaluate(model, X_test, y_test):
-    """计算三个评估指标"""
     pred = model.predict(X_test)
     rho, _ = spearmanr(y_test, pred)
     mae = np.mean(np.abs(pred - y_test))
     rmse = np.sqrt(np.mean((pred - y_test) ** 2))
     return {'Spearman': rho, 'MAE': mae, 'RMSE': rmse}
 
+# 收集所有重复的结果
+all_results = {name: {'Spearman': [], 'MAE': [], 'RMSE': []}
+               for name in ['Random', 'Scaffold', 'Seq', 'Binding Mode']}
 
-# ---- 对每种划分分别训练+评估 ----
-print("\n========== 评估结果 ==========")
-results = {}
-models = {}
+print(f"\n========== 运行 {N_REPEATS} 次重复评估 ==========")
 
-for name, test_idx in splits.items():
-    if len(test_idx) == 0:
-        continue
+for seed in range(N_REPEATS):
+    splits = {}
 
-    # 互补集 = 全部 - 测试集
-    train_idx = np.setdiff1d(indices, test_idx)
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_test, y_test = X[test_idx], y[test_idx]
+    # 1. Random
+    _, test_idx = train_test_split(indices, test_size=0.2, random_state=seed)
+    splits['Random'] = test_idx
 
-    print(f"\n--- {name} ---")
-    print(f"  训练集: {len(train_idx)}, 测试集: {len(test_idx)}")
+    # 2. Scaffold (Morgan + Tanimoto)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+    _, test_idx = next(gss.split(df, groups=lig_groups))
+    splits['Scaffold'] = test_idx
 
-    # 训练 RF
-    rf = RandomForestRegressor(n_estimators=200, n_jobs=-1, random_state=42)
-    rf.fit(X_train, y_train)
-    rf_train_r2 = rf.score(X_train, y_train)
-    rf_res = evaluate(rf, X_test, y_test)
-    print(f"  RF:  train R2={rf_train_r2:.3f}, test Spearman={rf_res['Spearman']:.3f}, "
-          f"MAE={rf_res['MAE']:.3f}, RMSE={rf_res['RMSE']:.3f}")
+    # 3. Seq (k-mer)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+    _, test_idx = next(gss.split(df, groups=seq_groups))
+    splits['Seq'] = test_idx
 
-    # 训练 MLP
-    mlp = MLPRegressor(hidden_layer_sizes=(256, 128, 64), max_iter=300, random_state=42)
-    mlp.fit(X_train, y_train)
-    mlp_train_r2 = mlp.score(X_train, y_train)
-    mlp_res = evaluate(mlp, X_test, y_test)
-    print(f"  MLP: train R2={mlp_train_r2:.3f}, test Spearman={mlp_res['Spearman']:.3f}, "
-          f"MAE={mlp_res['MAE']:.3f}, RMSE={mlp_res['RMSE']:.3f}")
+    # 4. Binding Mode (KMeans with seed)
+    kmeans = KMeans(n_clusters=5, random_state=seed, n_init=10)
+    bm_labels = kmeans.fit_predict(X)
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+    _, test_idx = next(gss.split(df, groups=bm_labels))
+    splits['Binding Mode'] = test_idx
 
-    results[name] = {'RF': rf_res, 'MLP': mlp_res}
-    models[name] = {'RF': rf, 'MLP': mlp}
+    # 训练+评估
+    for name, test_idx in splits.items():
+        train_idx = np.setdiff1d(indices, test_idx)
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_test, y_test = X[test_idx], y[test_idx]
 
-# ---- 保存结果 ----
+        rf = RandomForestRegressor(n_estimators=400, max_depth=15,
+                                   min_samples_leaf=3, min_samples_split=6,
+                                   max_features='sqrt', n_jobs=-1, random_state=seed)
+        rf.fit(X_train, y_train)
+        res = evaluate(rf, X_test, y_test)
+        for metric in ['Spearman', 'MAE', 'RMSE']:
+            all_results[name][metric].append(res[metric])
+
+    print(f"  seed={seed} 完成")
+
+# ============= 汇总 =============
+print(f"\n========== 汇总 (均值±标准差, {N_REPEATS} 次重复) ==========")
+print(f"{'Split':<15} {'Spearman':>18} {'MAE':>16} {'RMSE':>16}")
+print("-" * 68)
+
+final_results = {}
+for name in ['Random', 'Scaffold', 'Seq', 'Binding Mode']:
+    r = all_results[name]
+    spearman_str = f"{np.mean(r['Spearman']):.3f}±{np.std(r['Spearman']):.3f}"
+    mae_str = f"{np.mean(r['MAE']):.3f}±{np.std(r['MAE']):.3f}"
+    rmse_str = f"{np.mean(r['RMSE']):.3f}±{np.std(r['RMSE']):.3f}"
+    print(f"{name:<15} {spearman_str:>18} {mae_str:>16} {rmse_str:>16}")
+    final_results[name] = {
+        'Spearman_mean': float(np.mean(r['Spearman'])),
+        'Spearman_std': float(np.std(r['Spearman'])),
+        'MAE_mean': float(np.mean(r['MAE'])),
+        'MAE_std': float(np.std(r['MAE'])),
+        'RMSE_mean': float(np.mean(r['RMSE'])),
+        'RMSE_std': float(np.std(r['RMSE'])),
+    }
+
 with open('results.json', 'w') as f:
-    json.dump(results, f, indent=2)
-
-# 只保存 Random 划分的模型（后续分析用）
-import joblib
-if 'Random' in models:
-    joblib.dump(models['Random']['RF'], 'rf_model.pkl')
-    joblib.dump(models['Random']['MLP'], 'mlp_model.pkl')
-
-print("\n========== 汇总 ==========")
-print(f"{'Split':<15} {'RF Spearman':>12} {'RF MAE':>8} {'RF RMSE':>8}  |  {'MLP Spearman':>13} {'MLP MAE':>9} {'MLP RMSE':>9}")
-print("-" * 90)
-for name in results:
-    rf_r = results[name]['RF']
-    mlp_r = results[name]['MLP']
-    print(f"{name:<15} {rf_r['Spearman']:12.3f} {rf_r['MAE']:8.3f} {rf_r['RMSE']:8.3f}  |  "
-          f"{mlp_r['Spearman']:13.3f} {mlp_r['MAE']:9.3f} {mlp_r['RMSE']:9.3f}")
+    json.dump(final_results, f, indent=2)
 
 print("\n已保存: results.json")

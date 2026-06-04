@@ -1,11 +1,11 @@
 """
-改进版 PLIF（6维相互作用指纹）：增加几何约束
+改进版 PLIF（5维相互作用指纹）：增加几何约束
 
 改进点 vs 旧版：
   1. 氢键：增加 D-H···A 角度 ≥ 120° + H···A ≤ 2.5Å
   2. π-π堆积：增加环质心距离 + 环平面夹角检查
-  3. 金属配位：配位原子必须是 N, O, S
-  4. 疏水/盐桥：保持原有距离规则（无强方向性约束）
+  3. 疏水/盐桥：保持原有距离规则（无强方向性约束）
+  （删除金属配位维度：Permutation Importance 分析显示贡献为零）
 
 统一用 RDKit 处理蛋白和配体（含加氢），不再依赖 Biopython。
 """
@@ -63,8 +63,6 @@ HYDROPHOBIC_RES = {'ALA', 'VAL', 'LEU', 'ILE', 'PHE', 'TRP', 'MET', 'PRO', 'TYR'
 POSITIVE_RES    = {'LYS', 'ARG', 'HIS'}
 NEGATIVE_RES    = {'ASP', 'GLU'}
 AROMATIC_RES    = {'PHE', 'TYR', 'TRP', 'HIS'}
-METAL_ELEMENTS  = {'ZN', 'MG', 'CA', 'MN', 'FE', 'CO', 'NI', 'CU'}
-
 # 截断半径
 CUTOFF_HYDROPHOBIC = 4.5
 CUTOFF_HBOND       = 3.5   # D···A 距离
@@ -73,21 +71,20 @@ CUTOFF_HBOND_HA    = 2.5   # H···A 距离
 CUTOFF_HBOND_DEV = 60.0   # 偏离线性的最大角度
 CUTOFF_PI_CENTROID = 5.5   # 环质心距离
 CUTOFF_SALT        = 4.0
-CUTOFF_METAL       = 3.0
 
 
 # ===================== 主函数 =====================
 
 def compute_simple_plif(protein_pdb_path, ligand_path):
     """
-    计算改进版蛋白-配体相互作用指纹（6维向量）
+    计算改进版蛋白-配体相互作用指纹（5维向量）
 
     参数:
         protein_pdb_path: 蛋白 PDB 文件路径
         ligand_path:      配体 .mol2 或 .sdf 文件路径
 
     返回:
-        6维 numpy 数组 [疏水, H供体, H受体, π-π, 盐桥, 金属]
+        5维 numpy 数组 [疏水, H供体, H受体, π-π, 盐桥]
         失败返回 None
     """
     # ========== 1. 加载配体（保留氢） ==========
@@ -237,7 +234,6 @@ def compute_simple_plif(protein_pdb_path, ligand_path):
     hbond_acceptor = 0
     pi_stacking   = 0
     salt_bridge   = 0
-    metal_coord   = 0
 
     # --- 3a. 重原子对距离检查：疏水、盐桥、金属 ---
     for i, lig_pos in enumerate(lig_heavy_pos):
@@ -264,12 +260,6 @@ def compute_simple_plif(protein_pdb_path, ligand_path):
                     salt_bridge += 1
                 if res in NEGATIVE_RES and lig_elem == 'N':
                     salt_bridge += 1
-
-            # 金属配位（增加：配体原子必须是 N,O,S）
-            if (dist <= CUTOFF_METAL and
-                elem_j in METAL_ELEMENTS and
-                lig_elem in ('N', 'O', 'S')):
-                metal_coord += 1
 
     # --- 3b. 氢键供体（蛋白供体 → 配体受体） ---
     for donor_idx, h_pos in prot_donor_pairs:
@@ -318,7 +308,7 @@ def compute_simple_plif(protein_pdb_path, ligand_path):
 
     # ========== 4. 归一化 ==========
     fp = np.array([hydrophobic, hbond_donor, hbond_acceptor,
-                   pi_stacking, salt_bridge, metal_coord], dtype=float)
+                   pi_stacking, salt_bridge], dtype=float)
     fp = fp / max(n_lig_heavy, 1)
 
     return fp

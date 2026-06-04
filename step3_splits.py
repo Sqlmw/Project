@@ -1,7 +1,7 @@
 """
 第3天：设计四种数据划分策略
 1. 随机划分（基线）
-2. 配体骨架新颖性划分（按Murcko骨架分组）
+2. 配体化学相似度划分（Morgan指纹 + Tanimoto聚类）
 3. 蛋白序列相似度划分（k-mer聚类）
 4. 结合模式划分（PLIF聚类）
 """
@@ -11,7 +11,8 @@ import pandas as pd
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.cluster import KMeans
 from rdkit import Chem, RDLogger
-from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Chem import AllChem
+from rdkit.DataStructs import TanimotoSimilarity
 from Bio.PDB import PDBParser
 from Bio.SeqUtils import seq1
 import pickle
@@ -36,33 +37,73 @@ train_idx, test_idx_random = train_test_split(indices, test_size=0.2, random_sta
 splits['Random'] = test_idx_random
 print(f"   测试集: {len(test_idx_random)}")
 
-# ==================== 2. 配体骨架划分 ====================
-print("2/4 配体骨架划分...")
-def get_scaffold(pdb, lig_suffix):
+# ==================== 2. 配体化学相似度划分 ====================
+print("2/4 配体化学相似度划分 (Morgan指纹 + Tanimoto聚类)...")
+
+from rdkit.Chem import AllChem
+
+def get_morgan_fp(pdb, lig_suffix):
+    """读取配体，返回 Morgan 指纹（ECFP4, 2048-bit）"""
     lig_path = os.path.join(refined_dir, pdb, f"{pdb}_ligand.{lig_suffix}")
     try:
-        # 根据文件格式选择正确的读取器
         if lig_suffix == 'mol2':
             mol = Chem.MolFromMol2File(lig_path, sanitize=True, removeHs=True)
         else:
             mol = Chem.MolFromMolFile(lig_path, sanitize=True, removeHs=True)
         if mol is None:
-            return pdb
-        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
-        if scaffold is None or scaffold.GetNumAtoms() == 0:
-            return pdb  # 无骨架，独自一组
-        return Chem.MolToSmiles(scaffold)
+            return None
+        return AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
     except:
-        return pdb
+        return None
 
-df['scaffold'] = df.apply(lambda r: get_scaffold(r['pdb'], r['ligand_suffix']), axis=1)
-n_scaffolds = df['scaffold'].nunique()
-print(f"   骨架种类: {n_scaffolds}")
+# 计算所有配体的 Morgan 指纹
+print("   计算配体 Morgan 指纹...")
+fps = {}
+for idx, row in df.iterrows():
+    fp = get_morgan_fp(row['pdb'], row['ligand_suffix'])
+    if fp is not None:
+        fps[idx] = fp
 
-gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-_, scaffold_test = next(gss.split(df, groups=df['scaffold']))
-splits['Scaffold'] = scaffold_test
-print(f"   测试集: {len(scaffold_test)}")
+# 计算无效（无法读取配体）的设独立组
+df['lig_cluster'] = df.index.map(lambda i: f"lig_{i}")
+
+# Tanimoto 贪心聚类
+from rdkit.DataStructs import TanimotoSimilarity
+
+print("   运行 Tanimoto 聚类 (threshold=0.5)...")
+lig_clusters = {}       # cluster_id -> [indices]
+lig_rep_fps = {}        # cluster_id -> representative fingerprint
+lig_cluster_of = {}     # df_index -> cluster_id
+
+valid_indices = list(fps.keys())
+cluster_id = 0
+
+# 按指纹有效数的降序排列（等价于按配体大小/复杂度，近似的）
+for idx in valid_indices:
+    fp = fps[idx]
+    assigned = False
+    for cid in list(lig_clusters.keys()):
+        if TanimotoSimilarity(fp, lig_rep_fps[cid]) >= 0.5:
+            lig_clusters[cid].append(idx)
+            lig_cluster_of[idx] = cid
+            assigned = True
+            break
+
+    if not assigned:
+        cid = f"C{cluster_id}"
+        cluster_id += 1
+        lig_clusters[cid] = [idx]
+        lig_rep_fps[cid] = fp
+        lig_cluster_of[idx] = cid
+
+df['lig_cluster'] = df.index.map(lambda i: lig_cluster_of.get(i, f"lig_{i}"))
+n_lig_clusters = df['lig_cluster'].nunique()
+print(f"   配体相似度聚类数: {n_lig_clusters}")
+
+gss_lig = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+_, lig_test = next(gss_lig.split(df, groups=df['lig_cluster']))
+splits['Scaffold'] = lig_test
+print(f"   测试集: {len(lig_test)}")
 
 # ==================== 3. 蛋白序列相似度划分 ====================
 print("3/4 蛋白序列提取与k-mer聚类...")
