@@ -256,7 +256,7 @@ ax2.bar(x2 + width/2, d_drops, width, color='#A23B72', label='Descriptors')
 ax2.set_xticks(x2)
 ax2.set_xticklabels(drop_names, fontsize=11)
 ax2.set_ylabel('Drop from Random (%)', fontsize=12)
-ax2.set_title('Generalization Drop', fontsize=13)
+ax2.set_title('Drop Relative to Random', fontsize=13)
 ax2.legend(loc='upper right', frameon=False, fontsize=10)
 ax2.set_ylim(0, 65)
 
