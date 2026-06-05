@@ -29,8 +29,9 @@ df_plot = pd.DataFrame(data).T
 print(f"\n{df_plot}")
 
 plt.figure(figsize=(5, 4))
-sns.heatmap(df_plot.astype(float), annot=True, fmt='.3f', cmap='RdYlGn',
-            vmin=0.3, vmax=0.95, linewidths=1)
+sns.heatmap(df_plot.astype(float), annot=True, fmt='.3f',
+            cmap=sns.light_palette('#2E86AB', as_cmap=True),
+            vmin=0.30, vmax=0.60, linewidths=1)
 plt.title('Generalization Performance (Spearman rho)')
 plt.tight_layout()
 plt.savefig('heatmap.png', dpi=300)
