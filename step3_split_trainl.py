@@ -1,5 +1,6 @@
 """
-第4天：对每种划分训练RF，多次重复评估，报告均值±标准差
+Step 4：对每种划分独立训练 RF，5 次重复评估，报告均值±标准差
+核心改进：每种划分用自己的训练集（互补集），避免信息泄漏
 """
 import numpy as np
 import pandas as pd
@@ -8,7 +9,6 @@ import json
 import os
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
-from sklearn.cluster import KMeans
 from scipy.stats import spearmanr
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
@@ -27,14 +27,14 @@ df = pd.read_csv("pdbbind_valid.csv")
 refined_dir = "refined-set"
 indices = np.arange(len(X))
 
-N_REPEATS = 5
+N_REPEATS = 5  # 用 5 个不同随机种子重复评估
 print(f"总样本: {len(X)}, 特征: {X.shape[1]}维, pK: [{y.min():.2f}, {y.max():.2f}]")
 print(f"重复次数: {N_REPEATS}")
 
-# ============= 预计算（不随种子变化） =============
-
-# --- 配体 Morgan 指纹 ---
+# ============= 预计算：配体 Morgan 指纹 + Tanimoto 聚类 =============
+# 聚类是确定性的，算一次即可，5 次重复共用
 print("\n预计算配体 Morgan 指纹...")
+
 def get_morgan_fp(pdb, lig_suffix):
     lig_path = os.path.join(refined_dir, pdb, f"{pdb}_ligand.{lig_suffix}")
     try:
@@ -54,13 +54,10 @@ for idx, row in df.iterrows():
     if fp is not None:
         fps[idx] = fp
 
-# Tanimoto 贪心聚类
-lig_cluster_of = {}
-lig_clusters = {}
-lig_rep_fps = {}
+# Tanimoto 贪心聚类：≥ 0.5 归入同簇
+lig_cluster_of, lig_clusters, lig_rep_fps = {}, {}, {}
 cluster_id = 0
-valid_indices_fp = list(fps.keys())
-for idx in valid_indices_fp:
+for idx in list(fps.keys()):
     fp = fps[idx]
     assigned = False
     for cid in list(lig_clusters.keys()):
@@ -78,8 +75,9 @@ for idx in valid_indices_fp:
 
 lig_groups = df.index.map(lambda i: lig_cluster_of.get(i, f"lig_{i}"))
 
-# --- 蛋白序列 + k-mer 聚类 ---
+# ============= 预计算：蛋白序列 + k-mer 聚类 =============
 print("预计算蛋白序列 k-mer 聚类...")
+
 def extract_seq(pdb):
     protein_pdb = os.path.join(refined_dir, pdb, f"{pdb}_protein.pdb")
     parser = PDBParser(QUIET=True)
@@ -116,10 +114,8 @@ def jaccard(set1, set2):
 def greedy_kmer_cluster(seqs, k=3, threshold=0.3):
     sorted_idx = sorted(range(len(seqs)), key=lambda i: len(seqs[i]), reverse=True)
     kmer_sets = [kmer_set(seqs[i], k) for i in sorted_idx]
-    clusters = {}
-    rep_kmers = {}
-    cluster_of = {}
-    cluster_id_cnt = 0
+    clusters, rep_kmers, cluster_of = {}, {}, {}
+    cid_cnt = 0
     for orig_idx, ks in zip(sorted_idx, kmer_sets):
         if len(ks) == 0:
             cluster_of[orig_idx] = f"short_{orig_idx}"
@@ -132,8 +128,8 @@ def greedy_kmer_cluster(seqs, k=3, threshold=0.3):
                 assigned = True
                 break
         if not assigned:
-            cid = f"C{cluster_id_cnt}"
-            cluster_id_cnt += 1
+            cid = f"C{cid_cnt}"
+            cid_cnt += 1
             clusters[cid] = [orig_idx]
             rep_kmers[cid] = ks
             cluster_of[orig_idx] = cid
@@ -143,16 +139,68 @@ seq_list = df['protein_seq'].tolist()
 seq_cluster_of = greedy_kmer_cluster(seq_list, k=3, threshold=0.3)
 seq_groups = df.index.map(lambda i: seq_cluster_of.get(i, f"uniq_{i}"))
 
-
 # ============= 多次重复评估 =============
 def evaluate(model, X_test, y_test):
+    """计算三个回归评估指标"""
     pred = model.predict(X_test)
     rho, _ = spearmanr(y_test, pred)
     mae = np.mean(np.abs(pred - y_test))
     rmse = np.sqrt(np.mean((pred - y_test) ** 2))
     return {'Spearman': rho, 'MAE': mae, 'RMSE': rmse}
 
-# 收集所有重复的结果
+# ============= 预计算：结合口袋残基组成分类（替代 KMeans） =============
+print("\n预计算结合口袋类型...")
+
+# 氨基酸分类
+HYDROPHOBIC_AA = {'ALA', 'VAL', 'LEU', 'ILE', 'PHE', 'TRP', 'MET', 'PRO', 'TYR', 'CYS'}
+CHARGED_AA = {'LYS', 'ARG', 'HIS', 'ASP', 'GLU'}
+AROMATIC_AA = {'PHE', 'TYR', 'TRP', 'HIS'}
+POLAR_AA = {'SER', 'THR', 'ASN', 'GLN'}
+
+def classify_pocket(pdb):
+    """读 pocket.pdb，按残基组成比例分类为 疏水型/带电型/极性型"""
+    pocket_path = os.path.join(refined_dir, pdb, f"{pdb}_pocket.pdb")
+    if not os.path.exists(pocket_path):
+        return 0  # 缺失文件归默认类
+    parser = PDBParser(QUIET=True)
+    try:
+        structure = parser.get_structure(pdb, pocket_path)
+    except:
+        return 0
+    # 统计各类残基数量（去重：同一残基多种原子只计一次）
+    seen_residues = set()
+    counts = {'hydrophobic': 0, 'charged': 0, 'aromatic': 0, 'polar': 0}
+    for residue in structure.get_residues():
+        resname = residue.get_resname().strip()
+        res_id = (residue.get_full_id()[2], residue.get_full_id()[3][1])
+        if res_id in seen_residues:
+            continue
+        seen_residues.add(res_id)
+        if resname in HYDROPHOBIC_AA:
+            counts['hydrophobic'] += 1
+        if resname in CHARGED_AA:
+            counts['charged'] += 1
+        if resname in AROMATIC_AA:
+            counts['aromatic'] += 1
+        if resname in POLAR_AA:
+            counts['polar'] += 1
+    total = sum(counts.values())
+    if total == 0:
+        return 0
+    # 哪类占比最高就归哪类
+    if counts['charged'] / total >= 0.35:
+        return 2  # 带电型口袋
+    elif counts['hydrophobic'] / total >= 0.50:
+        return 1  # 疏水型口袋
+    else:
+        return 0  # 混合/极性型口袋
+
+# 预计算所有口袋类型（规则确定，不随种子变化）
+df['pocket_type'] = df['pdb'].apply(classify_pocket)
+pocket_type_counts = df['pocket_type'].value_counts().to_dict()
+print(f"   口袋类型分布: {pocket_type_counts}")
+
+pocket_groups = df['pocket_type'].values  # 作为 GroupShuffleSplit 的分组
 all_results = {name: {'Spearman': [], 'MAE': [], 'RMSE': []}
                for name in ['Random', 'Scaffold', 'Seq', 'Binding Mode']}
 
@@ -161,33 +209,33 @@ print(f"\n========== 运行 {N_REPEATS} 次重复评估 ==========")
 for seed in range(N_REPEATS):
     splits = {}
 
-    # 1. Random
+    # 1. Random：每次用不同 seed 生成新的随机切分
     _, test_idx = train_test_split(indices, test_size=0.2, random_state=seed)
     splits['Random'] = test_idx
 
-    # 2. Scaffold (Morgan + Tanimoto)
+    # 2. Scaffold：分组已固定，seed 改变的是哪些簇进测试集
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
     _, test_idx = next(gss.split(df, groups=lig_groups))
     splits['Scaffold'] = test_idx
 
-    # 3. Seq (k-mer)
+    # 3. Seq：同上，按序列簇分组
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
     _, test_idx = next(gss.split(df, groups=seq_groups))
     splits['Seq'] = test_idx
 
-    # 4. Binding Mode (KMeans with seed)
-    kmeans = KMeans(n_clusters=5, random_state=seed, n_init=10)
-    bm_labels = kmeans.fit_predict(X)
+    # 4. Binding Mode（口袋残基组成分类，规则确定，不依赖 PLIF/KMeans）
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
-    _, test_idx = next(gss.split(df, groups=bm_labels))
+    _, test_idx = next(gss.split(df, groups=pocket_groups))
     splits['Binding Mode'] = test_idx
 
-    # 训练+评估
+    # 对每种划分独立训练评估（互补集 = 全部 - 测试集）
     for name, test_idx in splits.items():
         train_idx = np.setdiff1d(indices, test_idx)
         X_train, y_train = X[train_idx], y[train_idx]
         X_test, y_test = X[test_idx], y[test_idx]
 
+        # 使用 step7 调优后的 RF 参数：限制树深、最小叶样本，防止过拟合
+        # 调优前默认参数（用于对比）
         rf = RandomForestRegressor(n_estimators=400, max_depth=15,
                                    min_samples_leaf=3, min_samples_split=6,
                                    max_features='sqrt', n_jobs=-1, random_state=seed)
@@ -206,10 +254,9 @@ print("-" * 68)
 final_results = {}
 for name in ['Random', 'Scaffold', 'Seq', 'Binding Mode']:
     r = all_results[name]
-    spearman_str = f"{np.mean(r['Spearman']):.3f}±{np.std(r['Spearman']):.3f}"
-    mae_str = f"{np.mean(r['MAE']):.3f}±{np.std(r['MAE']):.3f}"
-    rmse_str = f"{np.mean(r['RMSE']):.3f}±{np.std(r['RMSE']):.3f}"
-    print(f"{name:<15} {spearman_str:>18} {mae_str:>16} {rmse_str:>16}")
+    print(f"{name:<15} {np.mean(r['Spearman']):.3f}±{np.std(r['Spearman']):.3f}"
+          f"{'':>6} {np.mean(r['MAE']):.3f}±{np.std(r['MAE']):.3f}"
+          f"{'':>6} {np.mean(r['RMSE']):.3f}±{np.std(r['RMSE']):.3f}")
     final_results[name] = {
         'Spearman_mean': float(np.mean(r['Spearman'])),
         'Spearman_std': float(np.std(r['Spearman'])),

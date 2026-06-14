@@ -21,7 +21,8 @@ df = pd.read_csv("pdbbind_valid.csv")
 refined_dir = "refined-set"
 indices = np.arange(len(X))
 
-# ============= 提取蛋白序列 =============
+# ============= 提取蛋白序列（与 step3/step4 完全一致） =============
+# 从蛋白 PDB 中提取标准氨基酸序列（单字母），跳过 HETATM 和水
 def extract_seq(pdb):
     protein_pdb = os.path.join(refined_dir, pdb, f"{pdb}_protein.pdb")
     parser = PDBParser(QUIET=True)

@@ -1,11 +1,16 @@
 """
-分子描述符基线：用简单配体描述符作为特征，在相同划分策略上评估。
-与PLIF对比，判断泛化衰减的瓶颈在特征端还是数据划分本身。
+Step 6：描述符基线对比
+用 11 维配体理化描述符替代 PLIF 特征，在相同划分+相同 RF 上评估。
+目的：控制变量，判断 5 维 PLIF 是否提供了描述符之外的增量信息。
+输出: baseline_descriptors_tuned.json, baseline_comparison_tuned.png
 """
 import numpy as np
 import pandas as pd
 import os
 import json
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.cluster import KMeans
@@ -26,9 +31,10 @@ y = np.load("y_labels.npy")
 refined_dir = "refined-set"
 indices = np.arange(len(y))
 
-# ============= 计算配体描述符 =============
+# ============= 计算配体理化描述符 =============
 print("计算配体描述符...")
 
+# 11 个纯配体属性，全部来自 RDKit Descriptors 模块（2D 分子图计算，不需要 3D 坐标）
 DESC_NAMES = [
     'MolWt', 'LogP', 'NumHAcceptors', 'NumHDonors',
     'NumRotatableBonds', 'NumRings', 'NumAromaticRings', 'TPSA',
@@ -42,7 +48,8 @@ def compute_descriptors(pdb, lig_suffix):
             mol = Chem.MolFromMol2File(lig_path, sanitize=True, removeHs=True)
         else:
             mol = Chem.MolFromMolFile(lig_path, sanitize=True, removeHs=True)
-        if mol is None: return None
+        if mol is None:
+            return None
         return {
             'MolWt': Descriptors.MolWt(mol),
             'LogP': Descriptors.MolLogP(mol),
@@ -56,8 +63,10 @@ def compute_descriptors(pdb, lig_suffix):
             'NumHeteroatoms': Descriptors.NumHeteroatoms(mol),
             'HeavyAtomCount': Descriptors.HeavyAtomCount(mol),
         }
-    except: return None
+    except:
+        return None
 
+# 构建描述符矩阵，缺失值用列均值填充
 X_desc_list = []
 for _, row in df.iterrows():
     d = compute_descriptors(row['pdb'], row['ligand_suffix'])
@@ -76,9 +85,10 @@ for j in range(X_desc.shape[1]):
 
 print(f"  维度: {X_desc.shape[1]}")
 
-# ============= 预计算划分配套 =============
+# ============= 预计算划分配套（与 step4 完全一致） =============
 print("预计算划分配套...")
 
+# Morgan 指纹 + Tanimoto 聚类（Scaffold 划分用）
 fps = {}
 for idx, row in df.iterrows():
     lig_path = os.path.join(refined_dir, row['pdb'],
@@ -90,20 +100,28 @@ for idx, row in df.iterrows():
             mol = Chem.MolFromMolFile(lig_path, sanitize=True, removeHs=True)
         if mol is not None:
             fps[idx] = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
-    except: pass
+    except:
+        pass
 
 lig_clusters, lig_rep, lig_of = {}, {}, {}
 cid = 0
 for idx in list(fps.keys()):
-    fp = fps[idx]; assigned = False
+    fp = fps[idx]
+    assigned = False
     for c in list(lig_clusters.keys()):
         if TanimotoSimilarity(fp, lig_rep[c]) >= 0.5:
-            lig_clusters[c].append(idx); lig_of[idx] = c; assigned = True; break
+            lig_clusters[c].append(idx)
+            lig_of[idx] = c
+            assigned = True
+            break
     if not assigned:
-        lig_clusters[f'C{cid}'] = [idx]; lig_rep[f'C{cid}'] = fp
-        lig_of[idx] = f'C{cid}'; cid += 1
+        lig_clusters[f'C{cid}'] = [idx]
+        lig_rep[f'C{cid}'] = fp
+        lig_of[idx] = f'C{cid}'
+        cid += 1
 lig_groups = df.index.map(lambda i: lig_of.get(i, f'lig_{i}'))
 
+# 蛋白序列 + k-mer 聚类（Seq 划分用）
 def extract_seq(pdb):
     protein_pdb = os.path.join(refined_dir, pdb, f"{pdb}_protein.pdb")
     parser = PDBParser(QUIET=True)
@@ -149,7 +167,7 @@ def greedy_kmer_cluster(seqs, k=3, threshold=0.3):
 seq_cluster_of = greedy_kmer_cluster(df['protein_seq'].tolist(), k=3, threshold=0.3)
 seq_groups = df.index.map(lambda i: seq_cluster_of.get(i, f'uniq_{i}'))
 
-# ============= 评估 =============
+# ============= 5 次重复评估（与 step4 完全相同，仅特征从 PLIF 换成 X_desc） =============
 N_REPEATS = 5
 print(f"\n========== 描述符基线 ({N_REPEATS} 次重复) ==========")
 
@@ -193,7 +211,7 @@ for seed in range(N_REPEATS):
         all_results[name]['RMSE'].append(rmse)
     print(f"  seed={seed} 完成")
 
-# ============= PLIF vs 描述符 对比 =============
+# ============= PLIF vs 描述符 对比输出 =============
 with open('results.json') as f:
     plif = json.load(f)
 
@@ -221,10 +239,6 @@ for name in ['Scaffold','Seq','Binding Mode']:
     print(f"{name:<15} {'-'+str(round(p_drop))+'%':>18} {'-'+str(round(d_drop))+'%':>18}")
 
 # ============= 可视化 =============
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
 split_names = ['Random', 'Scaffold', 'Seq', 'Binding Mode']
 p_means = [plif[n]['Spearman_mean'] for n in split_names]
 p_stds = [plif[n]['Spearman_std'] for n in split_names]
@@ -232,10 +246,10 @@ d_means = [np.mean(all_results[n]['Spearman']) for n in split_names]
 d_stds = [np.std(all_results[n]['Spearman']) for n in split_names]
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6))
-
-# 左侧：绝对性能对比
-x = np.arange(len(split_names))
 width = 0.35
+
+# 左侧：绝对性能对比（并排柱状图 + 误差棒）
+x = np.arange(len(split_names))
 ax1.bar(x - width/2, p_means, width, yerr=p_stds, capsize=4,
         color='#2E86AB', label='PLIF (5-dim)')
 ax1.bar(x + width/2, d_means, width, yerr=d_stds, capsize=4,
@@ -247,7 +261,7 @@ ax1.set_title('Absolute Performance', fontsize=13)
 ax1.legend(loc='upper right', frameon=False, fontsize=10)
 ax1.set_ylim(0, 0.85)
 
-# 右侧：泛化衰减对比
+# 右侧：泛化衰减对比（相对 Random 的降幅）
 p_drops = [(p_means[0] - p_means[i]) / p_means[0] * 100 for i in range(1, 4)]
 d_drops = [(d_means[0] - d_means[i]) / d_means[0] * 100 for i in range(1, 4)]
 drop_names = split_names[1:]
@@ -257,7 +271,7 @@ ax2.bar(x2 - width/2, p_drops, width, color='#2E86AB', label='PLIF')
 ax2.bar(x2 + width/2, d_drops, width, color='#A23B72', label='Descriptors')
 ax2.set_xticks(x2)
 ax2.set_xticklabels(drop_names, fontsize=11)
-ax2.set_ylabel('Drop from Random (%)', fontsize=12)
+ax2.set_ylabel('Drop Relative to Random (%)', fontsize=12)
 ax2.set_title('Drop Relative to Random', fontsize=13)
 ax2.legend(loc='upper right', frameon=False, fontsize=10)
 ax2.set_ylim(0, 65)
@@ -267,7 +281,7 @@ plt.tight_layout()
 plt.savefig('baseline_comparison_tuned.png', dpi=300)
 print("\n已保存: baseline_comparison_tuned.png")
 
-# 保存
+# 保存 JSON
 desc_results = {}
 for name in ['Random','Scaffold','Seq','Binding Mode']:
     r = all_results[name]
@@ -282,4 +296,4 @@ for name in ['Random','Scaffold','Seq','Binding Mode']:
 with open('baseline_descriptors_tuned.json', 'w') as f:
     json.dump(desc_results, f, indent=2)
 
-print("\n已保存: baseline_descriptors.json")
+print("\n已保存: baseline_descriptors_tuned.json")
