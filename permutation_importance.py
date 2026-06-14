@@ -4,8 +4,12 @@ Permutation Importance：打乱特征列，测量 Spearman 下降量。
 """
 import numpy as np
 import pickle
+import os
 from sklearn.ensemble import RandomForestRegressor
 from scipy.stats import spearmanr
+
+# 确保工作目录在数据文件所在的上级目录
+os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 X = np.load("X_features.npy")
 y = np.load("y_labels.npy")

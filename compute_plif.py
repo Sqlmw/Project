@@ -17,7 +17,7 @@ from rdkit import RDLogger
 RDLogger.logger().setLevel(RDLogger.ERROR)
 
 
-# ===================== 辅助函数 =====================
+# ===================== 几何辅助函数（π-π 和 H-bond 角度计算用） =====================
 
 def _compute_plane_normal(points):
     """用 SVD 计算点集的最佳拟合平面法向量（单位向量）"""
@@ -35,7 +35,9 @@ def _angle_between(v1, v2):
     return float(np.degrees(np.arccos(cos)))
 
 
-# 蛋白芳香残基的环原子名（用于 π-π 检测）
+# ===================== 化学常量：基于药化知识的预定义规则集 =====================
+
+# 蛋白芳香残基的环原子名（按 PDB 标准命名，用于 π-π 检测）
 _AROM_RING_DEFS = {
     'PHE': {'6ring': ['CG', 'CD1', 'CD2', 'CE1', 'CE2', 'CZ']},
     'TYR': {'6ring': ['CG', 'CD1', 'CD2', 'CE1', 'CE2', 'CZ']},
@@ -63,7 +65,7 @@ HYDROPHOBIC_RES = {'ALA', 'VAL', 'LEU', 'ILE', 'PHE', 'TRP', 'MET', 'PRO', 'TYR'
 POSITIVE_RES    = {'LYS', 'ARG', 'HIS'}
 NEGATIVE_RES    = {'ASP', 'GLU'}
 AROMATIC_RES    = {'PHE', 'TYR', 'TRP', 'HIS'}
-# 截断半径
+# ===================== 截断半径与角度阈值（参考 PLIP 检测标准） =====================
 CUTOFF_HYDROPHOBIC = 4.5
 CUTOFF_HBOND       = 3.5   # D···A 距离
 CUTOFF_HBOND_HA    = 2.5   # H···A 距离
@@ -87,7 +89,7 @@ def compute_simple_plif(protein_pdb_path, ligand_path):
         5维 numpy 数组 [疏水, H供体, H受体, π-π, 盐桥]
         失败返回 None
     """
-    # ========== 1. 加载配体（保留氢） ==========
+    # ========== 1. 加载配体（保留氢原子，供 H-bond 角度计算用） ==========
     try:
         if ligand_path.endswith('.mol2'):
             mol_lig = Chem.MolFromMol2File(ligand_path, removeHs=False)
@@ -139,7 +141,8 @@ def compute_simple_plif(protein_pdb_path, ligand_path):
                 'normal': _compute_plane_normal(ring_pts),
             })
 
-    # ========== 2. 加载蛋白（RDKit + 加氢） ==========
+    # ========== 2. 加载蛋白（RDKit 读 PDB + AddHs 加氢 ==========
+    # sanitize=False：避免 RDKit 对金属/非标准残基的价键检查报错
     try:
         mol_prot = Chem.MolFromPDBFile(protein_pdb_path, removeHs=False,
                                        sanitize=False)
@@ -228,7 +231,7 @@ def compute_simple_plif(protein_pdb_path, ligand_path):
                     'positions': pts,
                 })
 
-    # ========== 3. 相互作用计数 ==========
+    # ========== 3. 相互作用计数：遍历所有蛋白-配体重原子对 ==========
     hydrophobic   = 0
     hbond_donor   = 0
     hbond_acceptor = 0
@@ -306,7 +309,7 @@ def compute_simple_plif(protein_pdb_path, ligand_path):
                 if plane_angle <= 30.0 or plane_angle >= 60.0:
                     pi_stacking += 1
 
-    # ========== 4. 归一化 ==========
+    # ========== 4. 归一化：除以配体重原子数，消除配体大小偏差 ==========
     fp = np.array([hydrophobic, hbond_donor, hbond_acceptor,
                    pi_stacking, salt_bridge], dtype=float)
     fp = fp / max(n_lig_heavy, 1)
